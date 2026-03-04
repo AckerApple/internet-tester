@@ -1,4 +1,4 @@
-import { main, section, subscribe, tag } from "taggedjs";
+import { a, main, p, section, subscribe, tag } from "taggedjs";
 import {
   renderHistoryCard,
   renderNetworkCard,
@@ -56,44 +56,53 @@ export function createAppTag({
       padding: 10px;
       box-sizing: border-box;
     `(
-      section.style`
-        width: min(1200px, 100%);
-        display: flex;
-        flex-wrap: wrap;
-        gap: 10px;
-        align-items: stretch;
-      `(
-        renderStatusCard({ status$, failures$, lastCheckedAt$, lastEndpointChecked$ }),
-        renderSettingsCard({ intervalSeconds$, onIntervalChange, soundButtonLabel$, toggleSounds }),
-        renderHistoryCard({ historyView$ }),
-        renderWebsitesCard({
-          endpointInput$,
-          endpointInputError$,
-          endpointListView$,
-          onEndpointInput,
-          addEndpoint,
-        }),
-        renderNetworkCard({
-          localIp$,
-          publicIpv4$,
-          publicIpv6$,
-          geoCity$,
-          geoRegion$,
-          geoPostal$,
-          geoCountry$,
-          geoIsp$,
-          geoAsn$,
-          geoTimezone$,
-          browserOnline$,
-          connectionType$,
-          connectionRtt$,
-          connectionDownlink$,
-          totalChecks$,
-          successfulChecks$,
-          failedChecks$,
-          uptimePercent$,
-          lastOutageDuration$,
-        }),
+      section.style`width: min(1200px, 100%); display: flex; flex-direction: column; gap: 10px;`(
+        section.style`
+          width: 100%;
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          align-items: stretch;
+        `(
+          renderStatusCard({ status$, failures$, lastCheckedAt$, lastEndpointChecked$ }),
+          renderSettingsCard({ intervalSeconds$, onIntervalChange, soundButtonLabel$, toggleSounds }),
+          renderHistoryCard({ historyView$ }),
+          renderWebsitesCard({
+            endpointInput$,
+            endpointInputError$,
+            endpointListView$,
+            onEndpointInput,
+            addEndpoint,
+          }),
+          renderNetworkCard({
+            localIp$,
+            publicIpv4$,
+            publicIpv6$,
+            geoCity$,
+            geoRegion$,
+            geoPostal$,
+            geoCountry$,
+            geoIsp$,
+            geoAsn$,
+            geoTimezone$,
+            browserOnline$,
+            connectionType$,
+            connectionRtt$,
+            connectionDownlink$,
+            totalChecks$,
+            successfulChecks$,
+            failedChecks$,
+            uptimePercent$,
+            lastOutageDuration$,
+          }),
+        ),
+        p.style`margin: 2px 0 0; font-size: 0.72rem; opacity: 0.85; text-align: center;`(
+          a
+            .attr("href", "https://github.com/AckerApple/internet-tester")
+            .attr("target", "_blank")
+            .attr("rel", "noopener noreferrer")
+            .style`color: #0f766e; text-decoration: underline;`("code base"),
+        ),
       ),
     ),
   );
