@@ -9,6 +9,8 @@ const lastCheckedAt$ = new ValueSubject("--");
 const soundsEnabled$ = new ValueSubject(false);
 const soundButtonLabel$ = new ValueSubject("🔊 Enable no internet sounds");
 const intervalSeconds$ = new ValueSubject(5);
+const failureLog$ = new ValueSubject([]);
+const failureLogText$ = new ValueSubject("No failures logged yet.");
 
 const ENDPOINTS = [
   "https://www.google.com/generate_204",
@@ -16,6 +18,60 @@ const ENDPOINTS = [
 ];
 
 let audioContext;
+const FAILURE_LOG_LIMIT = 20;
+const FAILURE_LOG_DEDUP_MS = 60 * 1000;
+let isOfflineState = false;
+
+function formatDateToMinute(date) {
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function syncFailureLogText(entries) {
+  if (!entries.length) {
+    failureLogText$.next("No failures logged yet.");
+    return;
+  }
+
+  failureLogText$.next(
+    entries.map((entry, index) => `${index + 1}. ${entry.label}`).join("\n"),
+  );
+}
+
+function recordFailure() {
+  const now = Date.now();
+  const entries = failureLog$.value;
+  const lastEntry = entries[0];
+
+  if (lastEntry && now - lastEntry.timestamp < FAILURE_LOG_DEDUP_MS) {
+    return;
+  }
+
+  const nextEntries = [
+    { timestamp: now, label: `🛑 ${formatDateToMinute(new Date(now))}` },
+    ...entries,
+  ].slice(0, FAILURE_LOG_LIMIT);
+
+  failureLog$.next(nextEntries);
+  syncFailureLogText(nextEntries);
+}
+
+function recordRestored() {
+  const now = Date.now();
+  const entries = failureLog$.value;
+  const nextEntries = [
+    { timestamp: now, label: `🟢 ${formatDateToMinute(new Date(now))}` },
+    ...entries,
+  ].slice(0, FAILURE_LOG_LIMIT);
+
+  failureLog$.next(nextEntries);
+  syncFailureLogText(nextEntries);
+}
 
 async function ensureAudioContext() {
   if (!audioContext) {
@@ -118,6 +174,12 @@ const App = tag(() =>
         .onClick(toggleSounds)
         .style`margin-top: 16px; padding: 10px 14px; border: 0; border-radius: 8px; cursor: pointer; font-size: 0.95rem;`
         (subscribe(soundButtonLabel$)),
+      section.style`margin-top: 16px; text-align: left; max-width: 420px;`(
+        p.style`margin: 0 0 6px; font-size: 0.95rem; font-weight: 600;`("Last 20 history"),
+        p.style`margin: 0; font-size: 0.9rem; white-space: pre-line; line-height: 1.35;`(
+          subscribe(failureLogText$),
+        ),
+      ),
     ),
   ),
 );
@@ -149,15 +211,21 @@ async function checkInternet() {
   );
 
   if (anySucceeded) {
+    if (isOfflineState) {
+      recordRestored();
+    }
+    isOfflineState = false;
     failures$.next(0);
     status$.next("Online");
     color$.next("#22c55e");
     console.log("Online")
   } else {
+    recordFailure();
     const nextFailures = failures$.value + 1;
     failures$.next(nextFailures);
 
     if (nextFailures >= 2) {
+      isOfflineState = true;
       status$.next("Offline");
       console.log("🛑 Offline")
       color$.next("#ef4444");
