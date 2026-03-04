@@ -1,11 +1,20 @@
-import { callback, button, div, option, select, subscribe, ValueSubject, h1, main, p, section, tag, tagElement } from "taggedjs";
+import { button, div, input, option, select, subscribe, ValueSubject, h1, main, p, section, tag, tagElement } from "taggedjs";
 
 const appRoot = document.querySelector("#app");
+const runtime = window;
 
-const ENDPOINTS = [
+if (runtime.__internetTesterPollIntervalId) {
+  clearInterval(runtime.__internetTesterPollIntervalId);
+}
+if (runtime.__internetTesterPublicIpIntervalId) {
+  clearInterval(runtime.__internetTesterPublicIpIntervalId);
+}
+
+const DEFAULT_ENDPOINTS = [
   "https://www.google.com/generate_204",
   "https://www.youtube.com/generate_204",
 ];
+const ENDPOINT_STORAGE_KEY = "internet-tester-endpoints-v1";
 
 const status$ = new ValueSubject("Checking...");
 const color$ = new ValueSubject("#f59e0b");
@@ -14,7 +23,7 @@ const lastCheckedAt$ = new ValueSubject("--");
 const soundsEnabled$ = new ValueSubject(false);
 const soundButtonLabel$ = new ValueSubject("🔊 Enable no internet sounds");
 const intervalSeconds$ = new ValueSubject(5);
-const failureLog$ = new ValueSubject([]);
+const historyEvents$ = new ValueSubject([]);
 const historyView$ = new ValueSubject([
   p.style`margin: 0; font-size: 0.9rem; opacity: 0.85;`("No history yet."),
 ]);
@@ -39,22 +48,92 @@ const failedChecks$ = new ValueSubject(0);
 const uptimePercent$ = new ValueSubject("0.0%");
 const lastOutageDuration$ = new ValueSubject("--");
 const lastEndpointChecked$ = new ValueSubject("--");
-const endpointStates = ENDPOINTS.map((url) => ({
-  url,
-  name: new URL(url).hostname,
-  result$: new ValueSubject("Pending"),
-  lastCheckedAt$: new ValueSubject("--"),
-}));
+const endpointInput$ = new ValueSubject("");
+const endpointInputError$ = new ValueSubject("");
+const endpointListView$ = new ValueSubject([
+  p.style`margin: 0; font-size: 0.85rem; opacity: 0.85;`("No websites configured."),
+]);
+let endpointStates = [];
 
 let audioContext;
 const FAILURE_LOG_LIMIT = 20;
 const FAILURE_LOG_DEDUP_MS = 60 * 1000;
 const PUBLIC_IP_LOOKUP_INTERVAL_MS = 30 * 1000;
 let isOfflineState = false;
-let restorePending = false;
 let checkInProgress = false;
 let lastIpLookupAt = 0;
 let nextEndpointIndex = 0;
+let pollIntervalId;
+let publicIpIntervalId;
+let initialOnlineLogged = false;
+
+function normalizeEndpointUrl(inputValue) {
+  const raw = (inputValue || "").trim();
+  if (!raw) {
+    return null;
+  }
+
+  const withProtocol = raw.match(/^https?:\/\//i) ? raw : `https://${raw}`;
+  try {
+    const parsed = new URL(withProtocol);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function endpointName(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+function createEndpointState(url) {
+  return {
+    url,
+    name: endpointName(url),
+    result$: new ValueSubject("Pending"),
+    lastCheckedAt$: new ValueSubject("--"),
+  };
+}
+
+function saveEndpointsToStorage() {
+  try {
+    localStorage.setItem(
+      ENDPOINT_STORAGE_KEY,
+      JSON.stringify(endpointStates.map((entry) => entry.url)),
+    );
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+function loadEndpointsFromStorage() {
+  try {
+    const raw = localStorage.getItem(ENDPOINT_STORAGE_KEY);
+    if (!raw) {
+      return DEFAULT_ENDPOINTS;
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return DEFAULT_ENDPOINTS;
+    }
+
+    const normalized = parsed
+      .map((url) => normalizeEndpointUrl(url))
+      .filter(Boolean);
+    const unique = [...new Set(normalized)];
+    return unique.length ? unique : DEFAULT_ENDPOINTS;
+  } catch {
+    return DEFAULT_ENDPOINTS;
+  }
+}
 
 function formatDateToMinute(date) {
   return new Intl.DateTimeFormat(undefined, {
@@ -63,6 +142,7 @@ function formatDateToMinute(date) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
   }).format(date);
 }
 
@@ -117,54 +197,64 @@ function syncHistoryView(entries) {
   ));
 }
 
+function appendHistoryEvent(event) {
+  const entries = historyEvents$.value;
+  const nextEntries = [event, ...entries].slice(0, FAILURE_LOG_LIMIT);
+  historyEvents$.next(nextEntries);
+  syncHistoryView(nextEntries);
+}
+
 function recordFailure() {
   const now = Date.now();
-  const entries = failureLog$.value;
+  const entries = historyEvents$.value;
   const lastFailureEntry = entries.find((entry) => entry.type === "failure");
 
   if (lastFailureEntry && now - lastFailureEntry.timestamp < FAILURE_LOG_DEDUP_MS) {
     return false;
   }
 
-  const nextEntries = [
-    {
-      type: "failure",
-      icon: "🛑",
-      timestamp: now,
-      label: formatDateToMinute(new Date(now)),
-    },
-    ...entries,
-  ].slice(0, FAILURE_LOG_LIMIT);
-
-  failureLog$.next(nextEntries);
-  syncHistoryView(nextEntries);
+  appendHistoryEvent({
+    type: "failure",
+    icon: "🛑",
+    timestamp: now,
+    label: formatDateToMinute(new Date(now)),
+  });
   return true;
 }
 
 function recordRestored() {
   const now = Date.now();
-  const entries = failureLog$.value;
+  const entries = historyEvents$.value;
   const lastFailureEntry = entries.find((entry) => entry.type === "failure");
   const deltaMs = lastFailureEntry ? now - lastFailureEntry.timestamp : null;
   const delta = deltaMs ? formatDuration(deltaMs) : null;
 
-  const nextEntries = [
-    {
-      type: "restored",
-      icon: "🟢",
-      timestamp: now,
-      label: formatDateToMinute(new Date(now)),
-      delta,
-    },
-    ...entries,
-  ].slice(0, FAILURE_LOG_LIMIT);
-
-  failureLog$.next(nextEntries);
-  syncHistoryView(nextEntries);
+  appendHistoryEvent({
+    type: "restored",
+    icon: "🟢",
+    timestamp: now,
+    label: formatDateToMinute(new Date(now)),
+    delta,
+  });
 
   if (delta) {
     lastOutageDuration$.next(delta);
   }
+}
+
+function recordInitialOnline() {
+  const existingInitialOnline = historyEvents$.value.find((entry) => entry.type === "online");
+  if (existingInitialOnline) {
+    return;
+  }
+
+  const now = Date.now();
+  appendHistoryEvent({
+    type: "online",
+    icon: "🟢",
+    timestamp: now,
+    label: `Online ${formatDateToMinute(new Date(now))}`,
+  });
 }
 
 function updateConnectionDetails() {
@@ -529,45 +619,125 @@ function detailRow(label, value) {
   );
 }
 
+function syncEndpointListView() {
+  if (!endpointStates.length) {
+    endpointListView$.next([
+      p.style`margin: 0; font-size: 0.85rem; opacity: 0.85;`("No websites configured."),
+    ]);
+    return;
+  }
+
+  endpointListView$.next(
+    endpointStates.map((entry) =>
+      div.style`padding: 6px 8px; border-radius: 8px; background: rgba(255,255,255,0.42);`(
+        div.style`display:flex; justify-content:space-between; align-items:flex-start; gap:8px;`(
+          p.style`margin: 0; font-size: 1rem; font-weight: 700; color: #111827; overflow-wrap:anywhere;`(entry.name),
+          button
+            .onClick(() => removeEndpoint(entry.url))
+            .style`padding:2px 8px; border:0; border-radius:6px; cursor:pointer; font-size:0.75rem; flex:0 0 auto;`(
+              "Remove",
+            ),
+        ),
+        p.style`
+          margin: 2px 0 0;
+          font-size: 0.78rem;
+          line-height: 1.3;
+        `(
+          subscribe(entry.result$),
+          " • last checked ",
+          subscribe(entry.lastCheckedAt$),
+        ),
+      ),
+    ),
+  );
+}
+
+function removeEndpoint(url) {
+  const index = endpointStates.findIndex((entry) => entry.url === url);
+  if (index < 0) {
+    return;
+  }
+
+  endpointStates.splice(index, 1);
+  if (nextEndpointIndex >= endpointStates.length) {
+    nextEndpointIndex = 0;
+  }
+  if (!endpointStates.length) {
+    lastEndpointChecked$.next("--");
+  }
+  saveEndpointsToStorage();
+  syncEndpointListView();
+}
+
+function addEndpoint() {
+  const normalizedUrl = normalizeEndpointUrl(endpointInput$.value);
+  if (!normalizedUrl) {
+    endpointInputError$.next("Enter a valid website URL or hostname.");
+    return;
+  }
+
+  if (endpointStates.some((entry) => entry.url === normalizedUrl)) {
+    endpointInputError$.next("That website is already in the list.");
+    return;
+  }
+
+  endpointStates.push(createEndpointState(normalizedUrl));
+  endpointInput$.next("");
+  endpointInputError$.next("");
+  saveEndpointsToStorage();
+  syncEndpointListView();
+}
+
+function onEndpointInput(event) {
+  endpointInput$.next(event?.target?.value || "");
+  if (endpointInputError$.value) {
+    endpointInputError$.next("");
+  }
+}
+
+function onIntervalChange(event) {
+  const nextSeconds = Number.parseInt(event?.target?.value ?? "", 10);
+  if (!Number.isFinite(nextSeconds) || nextSeconds <= 0) {
+    return;
+  }
+
+  intervalSeconds$.next(nextSeconds);
+  startPolling();
+}
+
+function startPolling() {
+  if (pollIntervalId) {
+    clearInterval(pollIntervalId);
+  }
+
+  if (runtime.__internetTesterPollIntervalId) {
+    clearInterval(runtime.__internetTesterPollIntervalId);
+  }
+
+  pollIntervalId = setInterval(() => {
+    checkInternet();
+  }, intervalSeconds$.value * 1000);
+  runtime.__internetTesterPollIntervalId = pollIntervalId;
+}
+
+function startPublicIpPolling() {
+  if (publicIpIntervalId) {
+    clearInterval(publicIpIntervalId);
+  }
+
+  if (runtime.__internetTesterPublicIpIntervalId) {
+    clearInterval(runtime.__internetTesterPublicIpIntervalId);
+  }
+
+  refreshPublicIp(true);
+  publicIpIntervalId = setInterval(() => {
+    refreshPublicIp(true);
+  }, PUBLIC_IP_LOOKUP_INTERVAL_MS);
+  runtime.__internetTesterPublicIpIntervalId = publicIpIntervalId;
+}
+
 
 const App = tag(() => {
-  let pollIntervalId;
-  let publicIpIntervalId;
-
-  function onIntervalChange(event) {
-    const nextSeconds = Number.parseInt(event?.target?.value ?? "", 10);
-    if (!Number.isFinite(nextSeconds) || nextSeconds <= 0) {
-      return;
-    }
-
-    intervalSeconds$.next(nextSeconds);
-    startPolling();
-  }
-
-  function startPolling() {
-    if (pollIntervalId) {
-      clearInterval(pollIntervalId);
-    }
-
-    pollIntervalId = setInterval(callback(() => {
-      checkInternet()
-    }), intervalSeconds$.value * 1000);
-  }
-
-  function startPublicIpPolling() {
-    if (publicIpIntervalId) {
-      clearInterval(publicIpIntervalId);
-    }
-
-    refreshPublicIp(true);
-    publicIpIntervalId = setInterval(callback(() => {
-      refreshPublicIp(true);
-    }), PUBLIC_IP_LOOKUP_INTERVAL_MS);
-  }
-
-  startPolling();
-  startPublicIpPolling();
-
   return main.attr('style.background', subscribe(color$))
     .style`
       min-height: 100vh;
@@ -646,24 +816,24 @@ const App = tag(() => {
         flex: 1 1 300px;
       `(
         p.style`margin: 0 0 6px; font-size: 0.95rem; font-weight: 600;`("Websites checked"),
-        endpointStates.length
-          ? div.style`display: grid; gap: 4px;`(
-            endpointStates.map((entry) =>
-              div.style`padding: 6px 8px; border-radius: 8px; background: rgba(255,255,255,0.42);`(
-                p.style`margin: 0; font-size: 1rem; font-weight: 700; color: #111827;`(entry.name),
-                p.style`
-                  margin: 2px 0 0;
-                  font-size: 0.78rem;
-                  line-height: 1.3;
-                `(
-                  subscribe(entry.result$),
-                  " • last checked ",
-                  subscribe(entry.lastCheckedAt$),
-                ),
-              ),
+        div.style`display:flex; gap:8px; align-items:flex-start;`(
+          input
+            .onInput(onEndpointInput)
+            .attr("value", subscribe(endpointInput$))
+            .attr("placeholder", "google.com/generate_204")
+            .style`flex:1 1 auto; padding:8px; border:0; border-radius:8px; font-size:0.85rem;`,
+          button
+            .onClick(addEndpoint)
+            .style`padding:8px 10px; border:0; border-radius:8px; cursor:pointer; font-size:0.85rem; flex:0 0 auto;`(
+              "Add",
             ),
-          )
-          : p.style`margin: 0; font-size: 0.85rem; opacity: 0.85;`("No websites configured."),
+        ),
+        p.style`margin: 6px 0 0; font-size: 0.75rem; color: #b91c1c; min-height: 1em;`(
+          subscribe(endpointInputError$),
+        ),
+        div.style`display: grid; gap: 4px; margin-top: 6px;`(
+          subscribe(endpointListView$),
+        ),
       ),
       section.style`
         background: rgba(255,255,255,0.74);
@@ -729,10 +899,14 @@ async function checkInternet() {
   try {
     updateConnectionDetails();
     const checkTime = formatDateTime(new Date());
-    const endpointState = endpointStates[nextEndpointIndex];
-    if (!endpointState) {
+    if (!endpointStates.length) {
+      status$.next("No websites configured");
+      color$.next("#f59e0b");
+      lastEndpointChecked$.next("--");
       return;
     }
+    const safeIndex = nextEndpointIndex % endpointStates.length;
+    const endpointState = endpointStates[safeIndex];
 
     const probeSucceeded = await probe(endpointState.url);
     endpointState.result$.next(probeSucceeded ? "Success" : "Failed");
@@ -740,12 +914,20 @@ async function checkInternet() {
     lastEndpointChecked$.next(endpointState.name);
     updateCounters(probeSucceeded);
 
-    nextEndpointIndex = (nextEndpointIndex + 1) % endpointStates.length;
+    nextEndpointIndex = (safeIndex + 1) % endpointStates.length;
 
     if (probeSucceeded) {
-      if (restorePending || isOfflineState) {
+      if (!initialOnlineLogged && !runtime.__internetTesterInitialOnlineLogged && historyEvents$.value.length === 0) {
+        recordInitialOnline();
+        initialOnlineLogged = true;
+        runtime.__internetTesterInitialOnlineLogged = true;
+      }
+
+      const latestHistoryEntry = historyEvents$.value[0];
+      const shouldLogRestored = latestHistoryEntry?.type === "failure";
+      if (shouldLogRestored) {
         recordRestored();
-        restorePending = false;
+        console.log("🟢 Restored");
       }
       isOfflineState = false;
       refreshPublicIp();
@@ -754,10 +936,7 @@ async function checkInternet() {
       color$.next("#22c55e");
       console.log("Online");
     } else {
-      const failureLogged = recordFailure();
-      if (failureLogged) {
-        restorePending = true;
-      }
+      recordFailure();
       const nextFailures = failures$.value + 1;
       failures$.next(nextFailures);
 
@@ -779,10 +958,16 @@ async function checkInternet() {
   }
 }
 
+endpointStates = loadEndpointsFromStorage().map((url) => createEndpointState(url));
+saveEndpointsToStorage();
+syncEndpointListView();
+
 tagElement(App, appRoot);
 
 detectLocalNetworkIp().then((ip) => localIp$.next(ip));
 checkInternet();
+startPolling();
+startPublicIpPolling();
 
 window.addEventListener("online", () => {
   updateConnectionDetails();
