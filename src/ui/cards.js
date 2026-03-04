@@ -103,15 +103,17 @@ export function renderHistoryCard({ historyView$ }) {
           ];
         }
 
-        return history.map((entry, index) =>
-          p.style`
+        return history.map((entry, index) => {
+          return p.style`
             margin: 0;
             font-size: 0.9rem;
             line-height: 1.35;
             color: ${historyColor(entry.type)};
             font-weight: ${historyWeight(entry.type)};
-          `(`${index + 1}. ${entry.icon} ${entry.label}${entry.delta ? ` (delta ${entry.delta})` : ""}`),
-        );
+          `(
+             `${index + 1}. ${entry.icon} ${entry.label}${entry.delta ? ` (delta ${entry.delta})` : ""}`
+          ).key(entry.timestamp)
+        });
       }),
     ),
   );
