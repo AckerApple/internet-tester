@@ -1,4 +1,4 @@
-import { a, button, div, h1, input, option, p, section, select, subscribe } from "taggedjs";
+import { a, button, dialog, div, h1, input, option, p, section, select, subscribe } from "taggedjs";
 
 function historyColor(type) {
   if (type === "failure") {
@@ -34,7 +34,154 @@ function detailRow(label, value) {
   );
 }
 
-export function renderStatusCard({ status$, failures$, lastCheckedAt$, lastEndpointChecked$ }) {
+function renderCountdown(msRemaining) {
+  const seconds = Math.max(0, msRemaining) / 1000;
+  return `${seconds.toFixed(1)}s`;
+}
+
+function renderProgressWidth(progress) {
+  const safeProgress = Math.max(0, Math.min(100, progress));
+  return `${safeProgress}%`;
+}
+
+function resolveHistoryDialog(event) {
+  const sourceElement = event?.currentTarget || event?.target || null;
+  const sectionEl = sourceElement?.closest?.("section");
+  const bySection = sectionEl?.querySelector?.('[data-role="history-details-dialog"]');
+  if (bySection) {
+    return bySection;
+  }
+
+  const documentRef = sourceElement?.ownerDocument || document;
+  return (
+    documentRef.querySelector('[data-role="history-details-dialog"][open]') ||
+    documentRef.querySelector('[data-role="history-details-dialog"]')
+  );
+}
+
+function closeDialog(dialogEl) {
+  if (!dialogEl) {
+    return;
+  }
+
+  if (typeof dialogEl.close === "function") {
+    try {
+      dialogEl.close();
+      return;
+    } catch (error) {
+      console.warn("Failed to close history dialog with close().", error);
+    }
+  }
+
+  dialogEl.removeAttribute("open");
+}
+
+function closeHistoryDetails(event) {
+  const detailsDialog = resolveHistoryDialog(event);
+  closeDialog(detailsDialog);
+}
+
+function openHistoryDetails(event) {
+  const detailsDialog = resolveHistoryDialog(event);
+
+  if (!detailsDialog) {
+    console.warn("History details dialog not found.");
+    return;
+  }
+
+  if (typeof detailsDialog.showModal === "function") {
+    try {
+      detailsDialog.showModal();
+    } catch (error) {
+      console.warn("Unable to open history details dialog with showModal.", error);
+      detailsDialog.setAttribute("open", "");
+    }
+    return;
+  }
+
+  console.warn("History details dialog does not support showModal; using open attribute fallback.");
+  detailsDialog.setAttribute("open", "");
+}
+
+function closeHistoryDetailsOnBackdrop(event) {
+  const detailsDialog = event?.currentTarget || event?.target;
+  if (detailsDialog && event?.target === detailsDialog && detailsDialog.open) {
+    closeDialog(detailsDialog);
+  }
+}
+
+export function renderHistoryCard({ historyView$, historyDetails$ }) {
+  function renderHistoryEntries(history) {
+    if (!history?.length) {
+      return [
+        p.style`margin: 0; font-size: 0.9rem; opacity: 0.85;`("No history yet."),
+      ];
+    }
+
+    return history.map((entry, index) => {
+      return p.style`
+        margin: 0;
+        font-size: 0.9rem;
+        line-height: 1.35;
+        color: ${historyColor(entry.type)};
+        font-weight: ${historyWeight(entry.type)};
+      `(
+        `${index + 1}. ${entry.icon} ${entry.label}${entry.delta ? ` (delta ${entry.delta})` : ""}`,
+      ).key(entry.timestamp);
+    });
+  }
+
+  return section.style`
+    background: rgba(255,255,255,0.74);
+    border-radius: 10px;
+    padding: 12px;
+    text-align: left;
+    max-height: 42vh;
+    overflow: auto;
+    flex: 1 1 340px;
+  `(
+    div.style`display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px;`(
+      p.style`margin: 0; font-size: 0.95rem; font-weight: 600;`("Last 20 history"),
+      button
+        .onClick(openHistoryDetails)
+        .style`padding: 4px 10px; border: 0; border-radius: 7px; cursor: pointer; font-size: 0.8rem; text-transform: lowercase;`(
+          "details",
+        ),
+    ),
+    div.style`display: grid; gap: 4px;`(
+      subscribe(historyView$, renderHistoryEntries),
+    ),
+    dialog
+      .attr("data-role", "history-details-dialog")
+      .onClick(closeHistoryDetailsOnBackdrop)
+      .style`
+        width: min(900px, calc(100vw - 32px));
+        max-height: min(80vh, 760px);
+        border: 0;
+        border-radius: 12px;
+        padding: 14px;
+      `(
+        div.style`display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px;`(
+          p.style`margin: 0; font-size: 1rem; font-weight: 700;`("History details (up to 600)"),
+          button
+            .onClick(closeHistoryDetails)
+            .style`padding: 5px 10px; border: 0; border-radius: 7px; cursor: pointer; font-size: 0.82rem;`("Close"),
+        ),
+        div.style`display: grid; gap: 4px; max-height: min(64vh, 640px); overflow: auto;`(
+          subscribe(historyDetails$, renderHistoryEntries),
+        ),
+      ),
+  );
+}
+
+export function renderStatusCard({
+  status$,
+  failures$,
+  lastCheckedAt$,
+  lastEndpointChecked$,
+  nextCheckCountdownMs$,
+  nextCheckProgressPercent$,
+}) {
   return section.style`
     background: rgba(255,255,255,0.74);
     border-radius: 10px;
@@ -48,6 +195,25 @@ export function renderStatusCard({ status$, failures$, lastCheckedAt$, lastEndpo
     p.style`margin: 4px 0 0; font-size: 0.9rem; opacity: 0.9;`(
       "Last endpoint checked: ",
       subscribe(lastEndpointChecked$),
+    ),
+    p.style`margin: 10px 0 4px; font-size: 0.85rem; opacity: 0.9;`(
+      "Next check in: ",
+      subscribe(nextCheckCountdownMs$, renderCountdown),
+    ),
+    div.style`
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(17, 24, 39, 0.14);
+    `(
+      div
+        .attr("style.width", subscribe(nextCheckProgressPercent$, renderProgressWidth))
+        .style`
+          height: 100%;
+          background: linear-gradient(90deg, #0ea5e9, #22c55e);
+          transition: width 120ms linear;
+        `,
     ),
   );
 }
@@ -81,41 +247,6 @@ export function renderSettingsCard({
       .style`margin-top: 10px; width: 100%; padding: 10px 14px; border: 0; border-radius: 8px; cursor: pointer; font-size: 0.95rem;`(
         subscribe(soundButtonLabel$),
       ),
-  );
-}
-
-export function renderHistoryCard({ historyView$ }) {
-  return section.style`
-    background: rgba(255,255,255,0.74);
-    border-radius: 10px;
-    padding: 12px;
-    text-align: left;
-    max-height: 42vh;
-    overflow: auto;
-    flex: 1 1 340px;
-  `(
-    p.style`margin: 0 0 6px; font-size: 0.95rem; font-weight: 600;`("Last 20 history"),
-    div.style`display: grid; gap: 4px;`(
-      subscribe(historyView$, (history) => {
-        if (!history?.length) {
-          return [
-            p.style`margin: 0; font-size: 0.9rem; opacity: 0.85;`("No history yet."),
-          ];
-        }
-
-        return history.map((entry, index) => {
-          return p.style`
-            margin: 0;
-            font-size: 0.9rem;
-            line-height: 1.35;
-            color: ${historyColor(entry.type)};
-            font-weight: ${historyWeight(entry.type)};
-          `(
-             `${index + 1}. ${entry.icon} ${entry.label}${entry.delta ? ` (delta ${entry.delta})` : ""}`
-          ).key(entry.timestamp)
-        });
-      }),
-    ),
   );
 }
 
@@ -159,13 +290,7 @@ export function renderNetworkCard({
   localIp$,
   publicIpv4$,
   publicIpv6$,
-  geoCity$,
-  geoRegion$,
-  geoPostal$,
-  geoCountry$,
-  geoIsp$,
-  geoAsn$,
-  geoTimezone$,
+  userGeo$,
   browserOnline$,
   connectionType$,
   connectionRtt$,
@@ -176,6 +301,10 @@ export function renderNetworkCard({
   uptimePercent$,
   lastOutageDuration$,
 }) {
+  function geoValue(field) {
+    return subscribe(userGeo$, (profile) => profile?.[field] || "--");
+  }
+
   return section.style`
     background: rgba(255,255,255,0.74);
     border-radius: 10px;
@@ -191,13 +320,13 @@ export function renderNetworkCard({
       detailRow("Local Network IP", subscribe(localIp$)),
       detailRow("Public WAN IPv4", subscribe(publicIpv4$)),
       detailRow("Public WAN IPv6", subscribe(publicIpv6$)),
-      detailRow("City", subscribe(geoCity$)),
-      detailRow("State/Region", subscribe(geoRegion$)),
-      detailRow("Postal Code", subscribe(geoPostal$)),
-      detailRow("Country", subscribe(geoCountry$)),
-      detailRow("ISP", subscribe(geoIsp$)),
-      detailRow("ASN", subscribe(geoAsn$)),
-      detailRow("Time Zone", subscribe(geoTimezone$)),
+      detailRow("City", geoValue("city")),
+      detailRow("State/Region", geoValue("region")),
+      detailRow("Postal Code", geoValue("postal")),
+      detailRow("Country", geoValue("country")),
+      detailRow("ISP", geoValue("isp")),
+      detailRow("ASN", geoValue("asn")),
+      detailRow("Time Zone", geoValue("timezone")),
       detailRow("Browser online", subscribe(browserOnline$)),
       detailRow("Connection type", subscribe(connectionType$)),
       detailRow("RTT", subscribe(connectionRtt$)),

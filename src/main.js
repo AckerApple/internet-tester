@@ -21,6 +21,9 @@ if (runtime.__internetTesterPollIntervalId) {
 if (runtime.__internetTesterPublicIpIntervalId) {
   clearInterval(runtime.__internetTesterPublicIpIntervalId);
 }
+if (runtime.__internetTesterNextCheckTickerId) {
+  clearInterval(runtime.__internetTesterNextCheckTickerId);
+}
 
 const DEFAULT_ENDPOINTS = [
   "https://www.google.com/generate_204",
@@ -34,20 +37,26 @@ const color$ = new ValueSubject("#f59e0b");
 const failures$ = new ValueSubject(0);
 const lastCheckedAt$ = new ValueSubject("--");
 const soundsEnabled$ = new ValueSubject(false);
-const soundButtonLabel$ = new ValueSubject("🔊 Enable no internet sounds");
+const soundButtonLabel$ = new ValueSubject("🔊 Enable sounds");
 const intervalSeconds$ = new ValueSubject(5);
 const historyView$ = new ValueSubject([]);
+const historyDetails$ = new ValueSubject([]);
+const nextCheckCountdownMs$ = new ValueSubject(intervalSeconds$.value * 1000);
+const nextCheckProgressPercent$ = new ValueSubject(0);
 
 const localIp$ = new ValueSubject("--");
 const publicIpv4$ = new ValueSubject("Checking...");
 const publicIpv6$ = new ValueSubject("Checking...");
-const geoCity$ = new ValueSubject("--");
-const geoRegion$ = new ValueSubject("--");
-const geoPostal$ = new ValueSubject("--");
-const geoCountry$ = new ValueSubject("--");
-const geoIsp$ = new ValueSubject("--");
-const geoAsn$ = new ValueSubject("--");
-const geoTimezone$ = new ValueSubject("--");
+const DEFAULT_GEO_PROFILE = {
+  city: "--",
+  region: "--",
+  postal: "--",
+  country: "--",
+  isp: "--",
+  asn: "--",
+  timezone: "--",
+};
+const userGeo$ = new ValueSubject(DEFAULT_GEO_PROFILE);
 const browserOnline$ = new ValueSubject(navigator.onLine ? "Yes" : "No");
 const connectionType$ = new ValueSubject("Unknown");
 const connectionRtt$ = new ValueSubject("Unknown");
@@ -65,7 +74,8 @@ const endpointListView$ = new ValueSubject([
   p.style`margin: 0; font-size: 0.85rem; opacity: 0.85;`("No websites configured."),
 ]);
 
-const FAILURE_LOG_LIMIT = 20;
+const HISTORY_STORAGE_LIMIT = 600;
+const HISTORY_VIEW_LIMIT = 20;
 const FAILURE_LOG_DEDUP_MS = 60 * 1000;
 const PUBLIC_IP_LOOKUP_INTERVAL_MS = 30 * 1000;
 
@@ -77,15 +87,19 @@ let lastIpLookupAt = 0;
 let nextEndpointIndex = 0;
 let pollIntervalId;
 let publicIpIntervalId;
+let nextCheckTickerId;
+let nextCheckDueAt = Date.now() + intervalSeconds$.value * 1000;
 let initialOnlineLogged = false;
 
 const history = createHistoryManager({
   historyEvents: HISTORY_EVENTS,
   historyView$,
+  historyDetails$,
   lastOutageDuration$,
   formatTimestamp,
   formatDuration,
-  limit: FAILURE_LOG_LIMIT,
+  storageLimit: HISTORY_STORAGE_LIMIT,
+  viewLimit: HISTORY_VIEW_LIMIT,
   dedupMs: FAILURE_LOG_DEDUP_MS,
 });
 
@@ -109,13 +123,15 @@ function onEndpointInput(event) {
 }
 
 function applyGeoProfile(profile) {
-  geoCity$.next(profile.city || "--");
-  geoRegion$.next(profile.region || "--");
-  geoPostal$.next(profile.postal || "--");
-  geoCountry$.next(profile.country || "--");
-  geoIsp$.next(profile.isp || "--");
-  geoAsn$.next(profile.asn || "--");
-  geoTimezone$.next(profile.timezone || "--");
+  userGeo$.next({
+    city: profile.city || "--",
+    region: profile.region || "--",
+    postal: profile.postal || "--",
+    country: profile.country || "--",
+    isp: profile.isp || "--",
+    asn: profile.asn || "--",
+    timezone: profile.timezone || "--",
+  });
 }
 
 async function fetchGeoProfile() {
@@ -315,13 +331,13 @@ function playNegativeSound() {
 async function toggleSounds() {
   if (soundsEnabled$.value) {
     soundsEnabled$.next(false);
-    soundButtonLabel$.next("🔊 Enable no internet sounds");
+    soundButtonLabel$.next("🔊 Enable sounds");
     return;
   }
 
   const enabled = await ensureAudioContext();
   soundsEnabled$.next(enabled);
-  soundButtonLabel$.next(enabled ? "🔇 Disable no internet sounds" : "🔊 Enable no internet sounds");
+  soundButtonLabel$.next(enabled ? "🔇 Disable sounds" : "🔊 Enable sounds");
 }
 
 function onIntervalChange(event) {
@@ -334,6 +350,36 @@ function onIntervalChange(event) {
   startPolling();
 }
 
+function updateNextCheckMeter() {
+  const intervalMs = intervalSeconds$.value * 1000;
+  const remainingMs = Math.max(0, nextCheckDueAt - Date.now());
+  const elapsedMs = intervalMs - remainingMs;
+  const progress = intervalMs > 0 ? (elapsedMs / intervalMs) * 100 : 0;
+
+  nextCheckCountdownMs$.next(remainingMs);
+  nextCheckProgressPercent$.next(Math.max(0, Math.min(100, progress)));
+}
+
+function resetNextCheckMeter() {
+  nextCheckDueAt = Date.now() + intervalSeconds$.value * 1000;
+  updateNextCheckMeter();
+}
+
+function startNextCheckTicker() {
+  if (nextCheckTickerId) {
+    clearInterval(nextCheckTickerId);
+  }
+  if (runtime.__internetTesterNextCheckTickerId) {
+    clearInterval(runtime.__internetTesterNextCheckTickerId);
+  }
+
+  updateNextCheckMeter();
+  nextCheckTickerId = setInterval(() => {
+    updateNextCheckMeter();
+  }, 100);
+  runtime.__internetTesterNextCheckTickerId = nextCheckTickerId;
+}
+
 function startPolling() {
   if (pollIntervalId) {
     clearInterval(pollIntervalId);
@@ -344,8 +390,12 @@ function startPolling() {
 
   pollIntervalId = setInterval(() => {
     checkInternet();
+    resetNextCheckMeter();
   }, intervalSeconds$.value * 1000);
   runtime.__internetTesterPollIntervalId = pollIntervalId;
+
+  resetNextCheckMeter();
+  startNextCheckTicker();
 }
 
 function startPublicIpPolling() {
@@ -469,11 +519,14 @@ const App = createAppTag({
   failures$,
   lastCheckedAt$,
   lastEndpointChecked$,
+  nextCheckCountdownMs$,
+  nextCheckProgressPercent$,
   intervalSeconds$,
   onIntervalChange,
   soundButtonLabel$,
   toggleSounds,
   historyView$,
+  historyDetails$,
   endpointInput$,
   endpointInputError$,
   endpointListView$,
@@ -482,13 +535,7 @@ const App = createAppTag({
   localIp$,
   publicIpv4$,
   publicIpv6$,
-  geoCity$,
-  geoRegion$,
-  geoPostal$,
-  geoCountry$,
-  geoIsp$,
-  geoAsn$,
-  geoTimezone$,
+  userGeo$,
   browserOnline$,
   connectionType$,
   connectionRtt$,

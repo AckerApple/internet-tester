@@ -1,14 +1,19 @@
 export function createHistoryManager({
   historyEvents,
   historyView$,
+  historyDetails$,
   lastOutageDuration$,
   formatTimestamp,
   formatDuration,
-  limit = 20,
+  storageLimit = 600,
+  viewLimit = 20,
   dedupMs = 60_000,
 }) {
   function syncHistoryView(entries) {
-    historyView$.next([...entries]);
+    historyView$.next(entries.slice(0, viewLimit));
+    if (historyDetails$) {
+      historyDetails$.next([...entries]);
+    }
   }
 
   function appendHistoryEvent(event) {
@@ -31,8 +36,8 @@ export function createHistoryManager({
     }
 
     historyEvents.unshift(event);
-    if (historyEvents.length > limit) {
-      historyEvents.length = limit;
+    if (historyEvents.length > storageLimit) {
+      historyEvents.length = storageLimit;
     }
     syncHistoryView(historyEvents);
     return true;
